@@ -1,0 +1,79 @@
+name: Delete Job
+run-name: MattDownloader delete ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Job id to delete
+        required: true
+
+permissions:
+  contents: write
+
+# Keep one writer at a time so delete jobs do not fight download jobs during git push.
+concurrency:
+  group: download-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$JOB_ID" =~ ^[A-Za-z0-9_-]{6,64}$ ]]; then
+            echo "Invalid job_id: $JOB_ID" >&2
+            exit 1
+          fi
+
+      - name: Delete job folder
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          AUTH_REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          git config --global http.version HTTP/1.1
+          git config --global http.postBuffer 524288000
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "$AUTH_REMOTE"
+
+          if [ ! -e "jobs/$JOB_ID" ]; then
+            echo "jobs/$JOB_ID does not exist on this branch. Nothing to delete."
+            exit 0
+          fi
+
+          git rm -r --ignore-unmatch "jobs/$JOB_ID"
+          if git diff --cached --quiet; then
+            echo "No tracked files found for jobs/$JOB_ID. Nothing to delete."
+            exit 0
+          fi
+
+          git commit -m "Delete MattDownloader job $JOB_ID"
+          for attempt in 1 2 3; do
+            echo "Pushing delete commit, attempt $attempt..."
+            if git push origin "HEAD:$BRANCH"; then
+              echo "Job files deleted successfully."
+              exit 0
+            fi
+            sleep $((attempt * 15))
+          done
+
+          echo "Could not push delete commit after retries." >&2
+          exit 1
