@@ -1,0 +1,201 @@
+name: Download and Prepare Job
+run-name: MattDownloader ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: Direct download URL
+        required: true
+      job_id:
+        description: Unique job id from app/bot, letters numbers dash underscore
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+# Keep one writer at a time so parallel jobs do not fight during git push.
+concurrency:
+  group: download-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      FILE_URL: ${{ inputs.file_url }}
+      JOB_ID: ${{ inputs.job_id }}
+      SINGLE_FILE_LIMIT_BYTES: 99614720   # 95 MiB, under GitHub's 100 MiB normal file limit
+      ZIP_SPLIT_SIZE: 90m                 # each .zNN part stays safely under 100 MiB
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$JOB_ID" =~ ^[A-Za-z0-9_-]{6,64}$ ]]; then
+            echo "Invalid job_id: $JOB_ID" >&2
+            exit 1
+          fi
+
+          if [[ ! "$FILE_URL" =~ ^https?:// ]]; then
+            echo "file_url must start with http:// or https://" >&2
+            exit 1
+          fi
+
+      - name: Prepare workspace and filename
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "jobs/$JOB_ID/tmp"
+          mkdir -p "jobs/$JOB_ID/zip"
+
+          python3 <<'PY' >> "$GITHUB_ENV"
+          import os
+          import re
+          from urllib.parse import urlparse, unquote
+
+          url = os.environ["FILE_URL"]
+          parsed = urlparse(url)
+          raw_name = unquote(parsed.path.rsplit("/", 1)[-1]) or "download.bin"
+          raw_name = raw_name.split("?", 1)[0].split("#", 1)[0]
+          safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._")[:180] or "download.bin"
+
+          if "." in safe:
+              zip_base = safe.rsplit(".", 1)[0]
+          else:
+              zip_base = safe
+          zip_base = re.sub(r"[^A-Za-z0-9._-]+", "_", zip_base).strip("._")[:160] or "download"
+          zip_base = f"{zip_base}_split"
+
+          print(f"SAFE_FILENAME={safe}")
+          print(f"ZIP_BASE={zip_base}")
+          PY
+
+      - name: Download file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DOWNLOAD_PATH="jobs/$JOB_ID/tmp/$SAFE_FILENAME"
+
+          curl \
+            --location \
+            --fail \
+            --retry 3 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            --connect-timeout 30 \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36" \
+            --output "$DOWNLOAD_PATH" \
+            "$FILE_URL"
+
+          SIZE_BYTES=$(wc -c < "$DOWNLOAD_PATH" | tr -d ' ')
+          echo "SIZE_BYTES=$SIZE_BYTES" >> "$GITHUB_ENV"
+          echo "Downloaded $SIZE_BYTES bytes"
+
+      - name: Create direct file or split ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DOWNLOAD_PATH="jobs/$JOB_ID/tmp/$SAFE_FILENAME"
+          JOB_DIR="jobs/$JOB_ID"
+
+          if [ "$SIZE_BYTES" -le "$SINGLE_FILE_LIMIT_BYTES" ]; then
+            MODE="single"
+            cp "$DOWNLOAD_PATH" "$JOB_DIR/$SAFE_FILENAME"
+          else
+            MODE="zip_split"
+
+            if ! command -v zip >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y zip
+            fi
+
+            zip -0 -s "$ZIP_SPLIT_SIZE" -j "$JOB_DIR/zip/$ZIP_BASE.zip" "$DOWNLOAD_PATH"
+          fi
+
+          export MODE
+
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          job_id = os.environ["JOB_ID"]
+          mode = os.environ["MODE"]
+          filename = os.environ["SAFE_FILENAME"]
+          size_bytes = int(os.environ["SIZE_BYTES"])
+          zip_base = os.environ.get("ZIP_BASE", "download_split")
+
+          job_dir = Path("jobs") / job_id
+          manifest = {
+              "job_id": job_id,
+              "mode": mode,
+              "file_url": os.environ["FILE_URL"],
+              "suggested_filename": filename,
+              "total_size_bytes": size_bytes,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+          }
+
+          if mode == "single":
+              manifest["single_file_path"] = str(job_dir / filename)
+          elif mode == "zip_split":
+              zip_dir = job_dir / "zip"
+
+              def sort_key(path: Path):
+                  name = path.name.lower()
+                  if name.endswith(".zip"):
+                      return (1, 0, name)
+                  match = re.search(r"\.z(\d+)$", name)
+                  if match:
+                      return (0, int(match.group(1)), name)
+                  return (2, 0, name)
+
+              parts = []
+              for path in sorted(zip_dir.iterdir(), key=sort_key):
+                  if path.is_file():
+                      parts.append({
+                          "name": path.name,
+                          "path": str(path),
+                          "size_bytes": path.stat().st_size,
+                      })
+
+              manifest["zip_folder"] = str(zip_dir)
+              manifest["zip_main_file"] = f"{zip_base}.zip"
+              manifest["zip_parts"] = parts
+          else:
+              raise SystemExit(f"Unknown mode: {mode}")
+
+          (job_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          PY
+
+          rm -rf "jobs/$JOB_ID/tmp"
+
+      - name: Commit job files to repo
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git pull --rebase origin "${GITHUB_REF_NAME:-main}"
+          git add "jobs/$JOB_ID"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Add MattDownloader job $JOB_ID"
+            git push
+          fi
